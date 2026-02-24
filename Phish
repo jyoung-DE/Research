@@ -1,0 +1,145 @@
+config timeframe = 1h
+
+// ── STAGE 1: Delivered phishing emails with URLs ──────────────────────────────
+| dataset = msft_defender_raw
+| filter category = "AdvancedHunting-EmailEvents"
+| alter
+    ThreatTypes       = json_extract_scalar(properties, "$.ThreatTypes"),
+    NetworkMessageId  = json_extract_scalar(properties, "$.NetworkMessageId"),
+    Subject           = json_extract_scalar(properties, "$.Subject"),
+    SenderFromAddress = json_extract_scalar(properties, "$.SenderFromAddress"),
+    DeliveryAction    = json_extract_scalar(properties, "$.DeliveryAction"),
+    RecipientEmailAddress = json_extract_scalar(properties, "$.RecipientEmailAddress"),
+    EmailTimestamp    = json_extract_scalar(properties, "$.Timestamp")
+| filter
+    NetworkMessageId != null
+    and NetworkMessageId != ""
+    and DeliveryAction in ("Delivered", "DeliveredAsSpam")
+    and (ThreatTypes ~= "Phish" or ThreatTypes ~= "Malware")
+
+// ── STAGE 2: Pull URLs embedded in those emails ───────────────────────────────
+| join type = inner (
+    dataset = msft_defender_raw
+    | filter category = "AdvancedHunting-EmailUrlInfo"
+    | alter
+        NetworkMessageId = json_extract_scalar(properties, "$.NetworkMessageId"),
+        Url              = json_extract_scalar(properties, "$.Url"),
+        UrlDomain        = json_extract_scalar(properties, "$.UrlDomain")
+    | filter
+        NetworkMessageId != null
+        and Url != null
+        // Exclude benign infrastructure that will generate FPs
+        and UrlDomain not ~= "microsoft\.com$"
+        and UrlDomain not ~= "office\.com$"
+        and UrlDomain not ~= "microsoftonline\.com$"
+        and UrlDomain not ~= "aka\.ms$"
+) as url_info
+    url_info.NetworkMessageId = NetworkMessageId
+
+// ── STAGE 3: Extract registered domain for endpoint correlation ───────────────
+| alter
+    EmailUrlRegisteredDomain = extract_url_registered_domain(url_info.Url)
+| filter EmailUrlRegisteredDomain != null
+
+// ── STAGE 4: Correlate with DeviceNetworkEvents — browser connected to domain ──
+// This is your new ClickThrough equivalent — OS-level proof of connection
+| join type = inner (
+    dataset = msft_defender_raw
+    | filter category = "AdvancedHunting-DeviceNetworkEvents"
+    | alter
+        RemoteUrl             = json_extract_scalar(properties, "$.RemoteUrl"),
+        RemotePort            = json_extract_scalar(properties, "$.RemotePort"),
+        InitiatingProcessName = json_extract_scalar(properties, "$.InitiatingProcessFileName"),
+        AccountUpn            = json_extract_scalar(properties, "$.AccountUpn"),
+        DeviceId              = json_extract_scalar(properties, "$.DeviceId"),
+        NetTimestamp          = json_extract_scalar(properties, "$.Timestamp")
+    // Only browser-initiated connections on web ports
+    | filter
+        RemotePort in ("80", "443")
+        and InitiatingProcessName in (
+            "chrome.exe", "msedge.exe", "firefox.exe",
+            "iexplore.exe", "opera.exe", "brave.exe"
+        )
+        // Exclude Defender/system scanning processes hitting same URLs
+        and InitiatingProcessName not in ("MpCmdRun.exe", "smartscreen.exe", "svchost.exe")
+    | alter
+        NetUrlRegisteredDomain = extract_url_registered_domain(RemoteUrl)
+    | filter NetUrlRegisteredDomain != null
+) as net_event
+    net_event.NetUrlRegisteredDomain = EmailUrlRegisteredDomain
+
+// ── STAGE 5: Enforce time ordering — network event AFTER email delivery ────────
+// Eliminates pre-existing connections to that domain as coincidental FPs
+| alter
+    EmailTs = to_timestamp(to_integer(EmailTimestamp), "MILLIS"),
+    NetTs   = to_timestamp(to_integer(net_event.NetTimestamp), "MILLIS")
+| filter
+    NetTs > EmailTs
+    and timestamp_diff(NetTs, EmailTs, "MINUTE") <= 60
+
+// ── STAGE 6: Join DeviceProcessEvents — browser launched from mail client ──────
+// Optional but high-confidence: proves causality not just correlation
+| join type = left (
+    dataset = msft_defender_raw
+    | filter category = "AdvancedHunting-DeviceProcessEvents"
+    | alter
+        ProcessName         = json_extract_scalar(properties, "$.FileName"),
+        ParentProcessName   = json_extract_scalar(properties, "$.InitiatingProcessFileName"),
+        DeviceId            = json_extract_scalar(properties, "$.DeviceId"),
+        ProcTimestamp       = json_extract_scalar(properties, "$.Timestamp"),
+        AccountUpn          = json_extract_scalar(properties, "$.AccountUpn")
+    | filter
+        ProcessName in ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe")
+        and ParentProcessName in ("outlook.exe", "teams.exe", "thunderbird.exe", "winword.exe")
+) as proc_event
+    proc_event.DeviceId = net_event.DeviceId
+    and proc_event.AccountUpn = net_event.AccountUpn
+
+// ── STAGE 7: Aggregate and score ──────────────────────────────────────────────
+| comp
+    values(Subject)                          as Subject,
+    values(SenderFromAddress)                as Sender,
+    values(url_info.Url)                     as EmailUrls,
+    values(EmailUrlRegisteredDomain)         as EmailDomains,
+    values(net_event.RemoteUrl)              as ConnectedUrls,
+    values(net_event.AccountUpn)             as AffectedUsers,
+    values(net_event.DeviceId)               as AffectedDevices,
+    values(net_event.InitiatingProcessName)  as BrowserProcess,
+    values(proc_event.ParentProcessName)     as MailClientProcess,
+    values(ThreatTypes)                      as ThreatTypes,
+    count_distinct(net_event.AccountUpn)     as UniqueUsersConnected,
+    earliest(EmailTimestamp)                 as EmailDeliveryTime,
+    earliest(net_event.NetTimestamp)         as FirstConnectionTime
+    by NetworkMessageId
+
+// ── STAGE 8: Confidence scoring ───────────────────────────────────────────────
+| alter
+    ConfidenceScore = add(
+        // Base: phish verdict + browser connection to email domain
+        50,
+        // Browser provably spawned from mail client = causality confirmed
+        if(MailClientProcess != null and MailClientProcess != "[]", 30, 0),
+        // Multiple users hit same phishing email = active campaign
+        if(UniqueUsersConnected > 1, 15, 0),
+        // Connection on 443 (HTTPS) = full page load more likely than probe
+        if(ConnectedUrls ~= "https://", 5, 0)
+    )
+
+| sort desc ConfidenceScore
+
+| fields
+    NetworkMessageId,
+    ConfidenceScore,
+    Subject,
+    Sender,
+    AffectedUsers,
+    AffectedDevices,
+    EmailUrls,
+    ConnectedUrls,
+    EmailDomains,
+    BrowserProcess,
+    MailClientProcess,
+    ThreatTypes,
+    UniqueUsersConnected,
+    EmailDeliveryTime,
+    FirstConnectionTime
